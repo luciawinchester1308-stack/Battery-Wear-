@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Battery Wear Tracker</title>
+<style>
+  :root { --bg:#10131a; --card:#1a1f2b; --text:#e8ecf4; --muted:#8a93a6; --accent:#4ade80; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font-family:system-ui,sans-serif; padding:16px; display:flex; justify-content:center; }
+  .wrap { width:100%; max-width:460px; display:flex; flex-direction:column; gap:14px; }
+  h1 { font-size:1.2rem; margin:4px 0 0; }
+  .card { background:var(--card); border-radius:14px; padding:16px; }
+  .big { font-size:2.4rem; font-weight:700; line-height:1; }
+  .big small { font-size:1rem; color:var(--muted); font-weight:400; }
+  .label { color:var(--muted); font-size:.75rem; text-transform:uppercase; letter-spacing:.05em; margin-bottom:6px; }
+  .bar { height:14px; background:#0b0e14; border-radius:7px; overflow:hidden; margin-top:12px; }
+  .fill { height:100%; width:0; background:var(--accent); transition:width .4s, background .4s; }
+  .row { display:flex; justify-content:space-between; gap:12px; }
+  .row > div { flex:1; }
+  .val { font-size:1.3rem; font-weight:600; }
+  .sub { color:var(--muted); font-size:.8rem; margin-top:4px; }
+  canvas { width:100%; height:160px; display:block; }
+  input[type=range] { width:100%; }
+  .leaves { display:flex; gap:6px; margin-top:8px; }
+  .leaf { width:18px; height:18px; border-radius:50% 0 50% 0; background:#2a3142; transition:background .3s; }
+  .leaf.on { background:#4ade80; }
+  .note { color:var(--muted); font-size:.8rem; margin-top:8px; }
+  label.sim { display:flex; align-items:center; gap:8px; font-size:.95rem; margin-top:10px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Battery Wear Tracker</h1>
+
+  <div class="card">
+    <div class="label" id="wearLabel">Wear this charge</div>
+    <div class="big"><span id="wear">0.000</span> <small>cycles</small></div>
+    <div class="bar"><div class="fill" id="fill"></div></div>
+    <div class="sub" id="range">--</div>
+  </div>
+
+  <div class="card row">
+    <div><div class="label">Battery</div><div class="val" id="level">--%</div></div>
+    <div><div class="label">Status</div><div class="val" id="status">--</div></div>
+  </div>
+
+  <div class="card">
+    <div class="label">Efficiency</div>
+    <div class="big"><span id="eff">--</span><small> %</small></div>
+    <div class="leaves" id="leaves"></div>
+    <div class="note" id="effNote">Efficiency = % charged ÷ wear in cycles. A full 0→100% charge gives 100%; charging only the low part gives much more.</div>
+  </div>
+
+  <div class="card">
+    <div class="label">Wear per percentage (shaded = this charge)</div>
+    <canvas id="chart"></canvas>
+  </div>
+
+  <div class="card" id="simCard">
+    <div class="label">Simulation</div>
+    <div class="note" id="apiNote"></div>
+    <input type="range" id="manual" min="0" max="100" value="50">
+    <label class="sim"><input type="checkbox" id="simCharge"> Plugged in (toggle to start a new session)</label>
+  </div>
+
+</div>
+
+<script>
+(function () {
+  const TOTAL = 1, STEPS = 100, RATIO = 1.08, KEY = 'bwt_session_v2';
+
+  const raw = Array.from({ length: STEPS }, (_, k) => Math.pow(RATIO, k));
+  const rawSum = raw.reduce((a, b) => a + b, 0);
+  const w = raw.map(x => x * TOTAL / rawSum);
+  const cum = [0];
+  for (let i = 0; i < STEPS; i++) cum.push(cum[i] + w[i]);
+  cum[STEPS] = TOTAL; // never above 1.000
+
+  const $ = id => document.getElementById(id);
+  const clampP = v => Math.max(0, Math.min(100, Math.round(v)));
+
+  let level = 50;
+  let charging = false;
+  let live = false;
+  // session: { active, start, end }
+  let sess = { active: false, start: 0, end: 0 };
+
+  function save() { try { localStorage.setItem(KEY, JSON.stringify(sess)); } catch (e) {} }
+  function load() {
+    try {
+      const s = JSON.parse(localStorage.getItem(KEY));
+      if (s && typeof s.start === 'number') sess = s;
+    } catch (e) {}
+  }
+
+  function startSession() { sess = { active: true, start: clampP(level), end: clampP(level) }; save(); }
+  function endSession()   { sess.active = false; sess.end = clampP(level); save(); }
+
+  function syncSession() {
+    const p = clampP(level);
+    if (charging) {
+      if (!sess.active) startSession();
+      else if (p < sess.start) { sess.start = p; save(); }
+    } else if (sess.active) {
+      endSession();
+    }
+  }
+
+  function stats() {
+    const s = sess.start;
+    const e = sess.active ? clampP(level) : sess.end;
+    const charged = Math.max(0, e - s);
+    const wear = Math.min(TOTAL, Math.max(0, cum[e] - cum[s]));
+    const eff = wear > 0 ? charged / wear : null;
+    return { s, e, charged, wear, eff };
+  }
+
+  function leavesFor(eff) {
+    if (eff === null) return 0;
+    return eff >= 800 ? 5 : eff >= 400 ? 4 : eff >= 200 ? 3 : eff >= 120 ? 2 : 1;
+  }
+
+  function drawChart(st) {
+    const c = $('chart'), dpr = window.devicePixelRatio || 1;
+    const W = c.clientWidth, H = c.clientHeight;
+    c.width = W * dpr; c.height = H * dpr;
+    const g = c.getContext('2d'); g.scale(dpr, dpr);
+    g.clearRect(0, 0, W, H);
+    const maxW = w[STEPS - 1], pad = 6;
+    const X = i => pad + (i / (STEPS - 1)) * (W - pad * 2);
+    const Y = i => H - pad - (w[i] / maxW) * (H - pad * 2);
+
+    // shaded session range: percentages st.s+1 .. st.e (indices st.s .. st.e-1)
+    if (st.e > st.s) {
+      g.fillStyle = 'rgba(74,222,128,0.25)';
+      g.beginPath();
+      g.moveTo(X(st.s), H - pad);
+      for (let i = st.s; i < st.e; i++) g.lineTo(X(i), Y(i));
+      g.lineTo(X(st.e - 1), H - pad);
+      g.closePath(); g.fill();
+    }
+
+    g.strokeStyle = '#4ade80'; g.lineWidth = 2; g.beginPath();
+    for (let i = 0; i < STEPS; i++) i ? g.lineTo(X(i), Y(i)) : g.moveTo(X(i), Y(i));
+    g.stroke();
+
+    const p = clampP(level);
+    if (p > 0) {
+      g.fillStyle = '#f59e0b'; g.beginPath(); g.arc(X(p - 1), Y(p - 1), 5, 0, Math.PI * 2); g.fill();
+    }
+  }
+
+  function render() {
+    syncSession();
+    const st = stats();
+    const p = clampP(level);
+
+    $('wearLabel').textContent = sess.active ? 'Wear this charge' : 'Wear last charge';
+    $('wear').textContent = st.wear.toFixed(3);
+    $('range').textContent = (sess.active || st.e > st.s)
+      ? 'Charged ' + st.s + '% → ' + st.e + '%  (+' + st.charged + '%)'
+      : 'No charge session yet';
+    $('level').textContent = p + '%';
+    $('status').textContent = charging ? 'Charging' : 'On battery';
+
+    const f = $('fill');
+    f.style.width = (st.wear / TOTAL * 100) + '%';
+    const pct = st.wear / TOTAL * 100;
+    f.style.background = pct < 40 ? '#4ade80' : pct < 75 ? '#f59e0b' : '#ef4444';
+
+    $('eff').textContent = st.eff === null ? '--' : Math.round(st.eff);
+    const n = leavesFor(st.eff);
+    const L = $('leaves');
+    if (!L.children.length) for (let i = 0; i < 5; i++) { const d = document.createElement('div'); d.className = 'leaf'; L.appendChild(d); }
+    Array.from(L.children).forEach((d, i) => d.classList.toggle('on', i < n));
+
+    drawChart(st);
+  }
+
+  load();
+
+  $('manual').addEventListener('input', e => { if (!live) { level = +e.target.value; render(); } });
+  $('simCharge').addEventListener('change', e => {
+    if (live) return;
+    charging = e.target.checked;
+    if (charging) startSession(); // replug = fresh session
+    render();
+  });
+  window.addEventListener('resize', render);
+
+  function fallback() {
+    live = false;
+    $('apiNote').textContent = 'Battery API not available here (needs Chrome on Android over HTTPS). Use the slider and checkbox to simulate.';
+    $('manual').value = level;
+    $('simCharge').checked = charging;
+    render();
+  }
+
+  if (navigator.getBattery) {
+    navigator.getBattery().then(b => {
+      live = true;
+      $('simCard').style.display = 'none';
+      let wasCharging = b.charging;
+      const update = () => {
+        level = b.level * 100;
+        // a fresh plug-in always starts a new session
+        if (b.charging && !wasCharging) startSession();
+        charging = b.charging;
+        wasCharging = b.charging;
+        render();
+      };
+      level = b.level * 100;
+      charging = b.charging;
+      b.addEventListener('levelchange', update);
+      b.addEventListener('chargingchange', update);
+      render();
+    }).catch(fallback);
+  } else fallback();
+})();
+</script>
+</body>
+</html>
