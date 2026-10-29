@@ -70,7 +70,7 @@ se<!DOCTYPE html>
 
 <script>
 (function () {
-  const TOTAL = 1, STEPS = 100, RATIO = 1.07, KEY = 'bwt_session_v2';
+  const TOTAL = 1, STEPS = 100, RATIO = 1.06, KEY = 'bwt_session_v2';
 
   const raw = Array.from({ length: STEPS }, (_, k) => Math.pow(RATIO, k));
   const rawSum = raw.reduce((a, b) => a + b, 0);
